@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+<title>Codex Quota</title>
+<organization>local.codex</organization>
+<welcome file="welcome.html" mime-type="text/html"/>
+<readme file="readme.html" mime-type="text/html"/>
+<conclusion file="conclusion.html" mime-type="text/html"/>
+<options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+<domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+<volume-check><allowed-os-versions><os-version min="14.0"/></allowed-os-versions></volume-check>
+<choices-outline><line choice="default"/></choices-outline>
+<choice id="default" title="Codex Quota" visible="false"><pkg-ref id="local.codex.quota-ring.installer"/></choice>
+<pkg-ref id="local.codex.quota-ring.installer" version="1.0.0" onConclusion="none">CodexQuota-component.pkg</pkg-ref>
+</installer-gui-script>
