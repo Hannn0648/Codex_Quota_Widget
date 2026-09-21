@@ -26,7 +26,7 @@
 - `Codex Quota.app`：已编译的本机应用。
 
 ```sh
-./build.sh
+zsh build.sh
 'Codex Quota.app/Contents/MacOS/CodexQuota' --self-test
 'Codex Quota.app/Contents/MacOS/CodexQuota' --probe
 open 'Codex Quota.app'
@@ -42,4 +42,4 @@ open 'Codex Quota.app'
 
 双击 `CodexQuota-1.0.0-arm64.pkg` 使用系统安装向导，包含介绍、说明、标准安装步骤与完成页面。安装目标为 `/Applications/Codex Quota.app`，支持 Apple Silicon / macOS 14+。安装结束后手动打开应用；若旧版本正在运行，先退出旧版本。本地安装包没有 Developer ID 签名和 Apple 公证。
 
-`Installer/` 保存安装向导资源及配置；运行 `./package.sh` 从现有应用生成 PKG。修改源码后先运行 `./build.sh`，再运行 `./package.sh`。
+`Installer/` 保存安装向导资源及配置；运行 `zsh package.sh` 从现有应用生成 PKG。修改源码后先运行 `zsh build.sh`，再运行 `zsh package.sh`。
