@@ -126,17 +126,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(barStyle ? "bar" : "ring", forKey: "displayStyle")
         render()
     }
+    private let hostBundleID = "com.openai.codex"
+    private var followingHost = false
     func applicationDidFinishLaunching(_ notification: Notification) {
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.target = self; item.button?.action = #selector(showDetails)
-        render(); refresh()
-        timer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
-        RunLoop.main.add(timer!, forMode: .common)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(refresh), name: NSWorkspace.didWakeNotification, object: nil)
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        hostChanged()
+    }
+    @objc func hostChanged() {
+        let hostRunning = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == hostBundleID && !$0.isTerminated }
+        guard hostRunning != followingHost else { return }
+        followingHost = hostRunning
+        if hostRunning {
+            item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            item.button?.target = self; item.button?.action = #selector(showDetails)
+            render(); refresh()
+            timer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
+            RunLoop.main.add(timer!, forMode: .common)
+        } else {
+            timer?.invalidate(); timer = nil
+            if let existing = item { NSStatusBar.system.removeStatusItem(existing); item = nil }
+            client.stop()
+        }
     }
     func applicationWillTerminate(_ notification: Notification) { client.stop() }
     @objc func refresh() {
-        guard !fetching else { return }; fetching = true
+        guard followingHost, !fetching else { return }; fetching = true
         client.fetch { [weak self] result in
             guard let self = self else { return }; self.fetching = false
             switch result {
@@ -147,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func render() {
-        guard let button = item.button else { return }
+        guard let button = item?.button else { return }
         let selected = usage?.selected
         let isBar = barStyle
         let alpha: CGFloat = failure == nil ? 1 : 0.4
