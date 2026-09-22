@@ -1,5 +1,9 @@
 # Codex Quota
 
+<img src="Assets/AppIcon.png" alt="Codex Quota 应用图标：圆环显示 80 余量" width="160" height="160">
+
+菜单栏实时查看 Codex 余量，支持圆环与横条样式、悬停查看重置时间，以及跟随 Codex 启停。图标中的 80 为固定展示示意，运行时显示实际剩余额度。
+
 原生 macOS 菜单栏额度圆环。双击 `Codex Quota.app` 启动，没有 Dock 图标。
 
 - 实线圆弧代表剩余额度，中心显示剩余百分比。
