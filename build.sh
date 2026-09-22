@@ -9,6 +9,7 @@ cat > 'Codex Quota.app/Contents/Info.plist' <<'PLIST'
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>CodexQuota</string>
 <key>CFBundleIdentifier</key><string>local.codex.quota-ring</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleName</key><string>Codex Quota</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>CFBundleShortVersionString</key><string>1.0.0</string>
@@ -16,4 +17,6 @@ cat > 'Codex Quota.app/Contents/Info.plist' <<'PLIST'
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+mkdir -p "Codex Quota.app/Contents/Resources"
+cp Assets/AppIcon.icns "Codex Quota.app/Contents/Resources/AppIcon.icns"
 codesign --force --sign - 'Codex Quota.app'

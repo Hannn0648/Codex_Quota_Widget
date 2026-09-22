@@ -43,3 +43,18 @@ open 'Codex Quota.app'
 双击 `CodexQuota-1.0.0-arm64.pkg` 使用系统安装向导，包含介绍、说明、标准安装步骤与完成页面。安装目标为 `/Applications/Codex Quota.app`，支持 Apple Silicon / macOS 14+。安装结束后手动打开应用；若旧版本正在运行，先退出旧版本。本地安装包没有 Developer ID 签名和 Apple 公证。
 
 `Installer/` 保存安装向导资源及配置；运行 `zsh package.sh` 从现有应用生成 PKG。修改源码后先运行 `zsh build.sh`，再运行 `zsh package.sh`。
+
+## 跟随 Codex（本地新版）
+
+监听 `com.openai.codex` 的启动与退出：Codex 运行时显示菜单栏组件并查询额度；完全退出后隐藏组件并停止查询。关闭窗口不等于退出。后台监听进程会保留，以接收下一次启动事件。
+
+将新构建的应用安装到 `/Applications` 后，运行 `zsh enable-follow.sh`，为当前用户启用登录时启动后台监听。退出额度应用会停止本次登录期间的监听；重新打开应用可恢复。
+
+停止登录时后台启动可执行：
+
+```sh
+launchctl bootout "gui/$(id -u)/local.codex.quota-ring.follow"
+rm "$HOME/Library/LaunchAgents/local.codex.quota-ring.follow.plist"
+```
+
+此前发布的 1.0.0 PKG 尚不包含此功能。
