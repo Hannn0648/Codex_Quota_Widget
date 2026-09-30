@@ -1,0 +1,16 @@
+#!/bin/bash
+set -eu
+# Offline target volumes load the agent at the next login.
+[[ "${3:-/}" == "/" ]] || exit 0
+console_uid=$(stat -f %u /dev/console)
+[[ "$console_uid" -ge 501 ]] || exit 0
+user_home=$(dscl . -read "/Users/$(id -nu "$console_uid")" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+label=local.codex.quota-ring.follow
+launchctl bootout "gui/$console_uid/$label" 2>/dev/null || true
+# Migrate the earlier opt-in user agent to the packaged system agent.
+if [[ -n "$user_home" && -f "$user_home/Library/LaunchAgents/$label.plist" ]]; then
+    rm "$user_home/Library/LaunchAgents/$label.plist"
+fi
+pkill -u "$console_uid" -x CodexQuota || true
+# The installation remains usable if no GUI session is available.
+launchctl bootstrap "gui/$console_uid" "/Library/LaunchAgents/$label.plist" || exit 0
