@@ -34,12 +34,12 @@ struct Window: Decodable {
 }
 struct Bucket: Decodable { let primary: Window?; let secondary: Window?; let planType: String? }
 struct Usage: Decodable {
-    let rateLimits: Bucket
+    let rateLimits: Bucket?
     let rateLimitsByLimitId: [String: Bucket]?
     let ordinaryUsageAllowed: Bool?
-    var bucket: Bucket { rateLimitsByLimitId?["codex"] ?? rateLimits }
+    var bucket: Bucket { rateLimitsByLimitId?["codex"] ?? rateLimits ?? Bucket(primary: nil, secondary: nil, planType: nil) }
     var windows: [Window] { [bucket.primary, bucket.secondary].compactMap { $0 } }
-    var selected: Window? { windows.first { $0.windowDurationMins == 300 } ?? windows.first { $0.windowDurationMins == 10080 } }
+    var selected: Window? { windows.first { $0.windowDurationMins == 300 } ?? windows.first { $0.windowDurationMins == 10080 } ?? windows.first }
     var weekly: Bool { selected?.windowDurationMins == 10080 }
 }
 
@@ -51,14 +51,52 @@ final class UsageClient {
     private var buffer = Data()
     private var completion: ((Result<Usage, Error>) -> Void)?
     private var timeout: Timer?
+    private var generation = 0
+    // Resolve on every read: an app update may replace or relocate the CLI.
+    static func bundledExecutable(in app: URL) -> String? {
+        let resources = app.appendingPathComponent("Contents/Resources")
+        let paths = ["codex-cli/bin/codex", "codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex"]
+        for path in paths {
+            let candidate = resources.appendingPathComponent(path).path
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        // Bounded fallback for future bundle layouts; avoid dependency trees.
+        guard let files = FileManager.default.enumerator(at: resources, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return nil }
+        var visited = 0
+        for case let url as URL in files {
+            visited += 1
+            if visited > 2000 { break }
+            if ["node_modules", "cua_node", "assets"].contains(url.lastPathComponent) || files.level > 7 {
+                files.skipDescendants(); continue
+            }
+            if url.lastPathComponent == "codex", !((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? true), FileManager.default.isExecutableFile(atPath: url.path) { return url.path }
+        }
+        return nil
+    }
     static var executable: String? {
-        let candidates = [ProcessInfo.processInfo.environment["CODEX_BINARY"], "/Applications/ChatGPT.app/Contents/Resources/codex", "/Applications/Codex.app/Contents/Resources/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
-        return candidates.compactMap { $0 }.first { FileManager.default.isExecutableFile(atPath: $0) }
+        let fm = FileManager.default
+        if let override = ProcessInfo.processInfo.environment["CODEX_BINARY"], fm.isExecutableFile(atPath: override) { return override }
+        var apps = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == "com.openai.codex" && !$0.isTerminated }.compactMap { $0.bundleURL }
+        if let registered = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") { apps.append(registered) }
+        apps += ["/Applications/ChatGPT.app", "/Applications/Codex.app", NSHomeDirectory() + "/Applications/ChatGPT.app", NSHomeDirectory() + "/Applications/Codex.app"].map { URL(fileURLWithPath: $0) }
+        var seen = Set<String>()
+        for app in apps where seen.insert(app.path).inserted {
+            if let path = bundledExecutable(in: app) { return path }
+        }
+        let candidates = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] + (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map { String($0) + "/codex" }
+        return candidates.first { fm.isExecutableFile(atPath: $0) }
+    }
+    static var executableFingerprint: String {
+        guard let path = executable else { return "missing" }
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: URL(fileURLWithPath: path).resolvingSymlinksInPath().path)) ?? [:]
+        return "\(path)|\(attrs[.modificationDate] ?? "")|\(attrs[.size] ?? "")|\(attrs[.systemFileNumber] ?? "")"
     }
     func fetch(_ done: @escaping (Result<Usage, Error>) -> Void) {
         guard completion == nil else { return }
         completion = done
-        guard let executable = Self.executable else { finish(.failure(error("找不到 Codex，请先安装并登录 Codex"))); return }
+        generation += 1
+        let requestGeneration = generation
+        guard let executable = Self.executable else { finish(.failure(error("找不到 Codex CLI：应用可能正在更新，将自动重新查找"))); return }
         let p = Process(), i = Pipe(), o = Pipe()
         p.executableURL = URL(fileURLWithPath: executable)
         p.arguments = ["app-server", "--listen", "stdio://"]
@@ -66,13 +104,23 @@ final class UsageClient {
         input = i.fileHandleForWriting; output = o.fileHandleForReading; process = p; buffer = Data()
         o.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
-            DispatchQueue.main.async { self?.receive(data) }
+            DispatchQueue.main.async {
+                guard let self = self, self.generation == requestGeneration else { return }
+                self.receive(data)
+            }
         }
         do {
             try p.run()
             send(["id": 1, "method": "initialize", "params": ["clientInfo": ["name": "codex_quota_ring", "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"]]])
             timeout = Timer.scheduledTimer(withTimeInterval: 25, repeats: false) { [weak self] _ in guard let self = self else { return }; self.finish(.failure(self.error("额度读取超时，请检查网络和 Codex 登录状态"))) }
         } catch { finish(.failure(error)) }
+    }
+    static func rpcError(_ value: [String: Any]) -> String {
+        let message = value["message"] as? String ?? "额度读取失败"
+        let lower = message.lowercased()
+        if value["code"] as? Int == -32601 { return "Codex 额度接口不兼容，请更新 Codex Quota" }
+        if ["unauthorized", "not logged", "authentication", "unauthenticated", "401", "sign in"].contains(where: { lower.contains($0) }) { return "Codex 登录状态失效，请在 Codex 中重新登录" }
+        return message
     }
     private func error(_ message: String) -> NSError { NSError(domain: "CodexQuota", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     private func send(_ value: [String: Any]) {
@@ -81,12 +129,12 @@ final class UsageClient {
     }
     private func receive(_ data: Data) {
         guard completion != nil else { return }
-        if data.isEmpty { finish(.failure(error("Codex 连接已结束"))); return }
+        if data.isEmpty { finish(.failure(error("Codex CLI 连接已结束：可能正在更新，将自动重连"))); return }
         buffer.append(data)
         while let newline = buffer.firstIndex(of: 10) {
             let line = buffer.subdata(in: 0..<newline); buffer.removeSubrange(0...newline)
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any], let id = obj["id"] as? Int else { continue }
-            if let e = obj["error"] as? [String: Any] { finish(.failure(error(e["message"] as? String ?? "额度读取失败"))); return }
+            if let e = obj["error"] as? [String: Any] { finish(.failure(error(Self.rpcError(e)))); return }
             if id == 1 {
                 send(["method": "initialized"])
                 send(["id": 2, "method": "account/rateLimits/read", "params": NSNull()])
@@ -94,13 +142,14 @@ final class UsageClient {
                 do {
                     let raw = try JSONSerialization.data(withJSONObject: obj["result"] ?? [:])
                     finish(.success(try JSONDecoder().decode(Usage.self, from: raw)))
-                } catch { finish(.failure(error)) }
+                } catch { finish(.failure(self.error("额度数据格式不兼容，请更新 Codex Quota"))) }
                 return
             }
         }
     }
     private func finish(_ result: Result<Usage, Error>) {
         guard let done = completion else { return }
+        generation += 1
         completion = nil; timeout?.invalidate(); timeout = nil
         output?.readabilityHandler = nil
         try? input?.close(); input = nil
@@ -120,6 +169,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var failure: String?
     var timer: Timer?
     var fetching = false
+    private var monitor: Timer?
+    private var retry: Timer?
+    private var failures = 0
+    private var cliFingerprint = ""
     var barStyle = UserDefaults.standard.string(forKey: "displayStyle") == "bar"
     @objc func chooseStyle(_ sender: NSMenuItem) {
         barStyle = sender.tag == 1
@@ -132,8 +185,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
-        center.addObserver(self, selector: #selector(hostChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        center.addObserver(self, selector: #selector(woke), name: NSWorkspace.didWakeNotification, object: nil)
         hostChanged()
+        monitor = Timer.scheduledTimer(timeInterval: 5, target: self, selector: #selector(checkInstallation), userInfo: nil, repeats: true)
+        RunLoop.main.add(monitor!, forMode: .common)
+    }
+    @objc func woke() { hostChanged(); refresh() }
+    @objc func checkInstallation() {
+        hostChanged()
+        guard followingHost else { return }
+        let fingerprint = UsageClient.executableFingerprint
+        guard fingerprint != cliFingerprint else { return }
+        cliFingerprint = fingerprint
+        retry?.invalidate(); retry = nil; failures = 0
+        client.stop()
+        retry?.invalidate(); retry = nil
+        refresh()
     }
     @objc func hostChanged() {
         let hostRunning = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == hostBundleID && !$0.isTerminated }
@@ -142,23 +209,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if hostRunning {
             item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             item.button?.target = self; item.button?.action = #selector(showDetails)
+            cliFingerprint = UsageClient.executableFingerprint
             render(); refresh()
             timer = Timer.scheduledTimer(timeInterval: 60, target: self, selector: #selector(refresh), userInfo: nil, repeats: true)
             RunLoop.main.add(timer!, forMode: .common)
         } else {
             timer?.invalidate(); timer = nil
+            retry?.invalidate(); retry = nil; failures = 0
             if let existing = item { NSStatusBar.system.removeStatusItem(existing); item = nil }
             client.stop()
         }
     }
-    func applicationWillTerminate(_ notification: Notification) { client.stop() }
+    func applicationWillTerminate(_ notification: Notification) { monitor?.invalidate(); retry?.invalidate(); client.stop() }
     @objc func refresh() {
-        guard followingHost, !fetching else { return }; fetching = true
+        guard followingHost, !fetching else { return }
+        retry?.invalidate(); retry = nil; fetching = true
         client.fetch { [weak self] result in
             guard let self = self else { return }; self.fetching = false
             switch result {
-            case .success(let value): self.usage = value; self.lastUpdate = Date(); self.failure = nil
-            case .failure(let error): self.failure = error.localizedDescription
+            case .success(let value): self.usage = value; self.lastUpdate = Date(); self.failure = nil; self.failures = 0
+            case .failure(let error):
+                self.failure = error.localizedDescription
+                if self.followingHost {
+                    self.failures += 1
+                    let delay = [5.0, 10, 20, 60][min(self.failures - 1, 3)]
+                    self.retry = Timer.scheduledTimer(timeInterval: delay, target: self, selector: #selector(self.refresh), userInfo: nil, repeats: false)
+                    RunLoop.main.add(self.retry!, forMode: .common)
+                }
             }
             self.render()
         }
@@ -205,7 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.imagePosition = .imageLeading
         button.title = ""
         button.font = NSFont.systemFont(ofSize: 10)
-        let prefix = failure == nil ? "" : "刷新失败，以下为上次数据\n"
+        let prefix = failure == nil ? "" : (usage == nil ? "" : "刷新失败：\(failure!)\n以下为上次数据\n")
         button.toolTip = prefix + (selected.map { "\($0.label)剩余 \(Int($0.remaining.rounded()))%\n\($0.resetText)" } ?? (failure ?? "正在读取额度…")) + (usage?.weekly == true ? "\n当前仅返回周额度，未返回 5 小时额度" : "")
         button.setAccessibilityLabel(button.toolTip)
     }
@@ -240,7 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 if CommandLine.arguments.contains("--self-test") {
     func check(_ json: String, _ percent: Double?, _ weekly: Bool) {
         let usage = try! JSONDecoder().decode(Usage.self, from: Data(json.utf8))
-        precondition(usage.selected?.remaining == percent && usage.weekly == weekly)
+        if usage.selected?.remaining != percent || usage.weekly != weekly { fputs("FAIL: \(json)\n", stderr); exit(1) }
     }
     check(#"{"rateLimits":{"primary":{"usedPercent":15,"windowDurationMins":10080}}}"#, 85, true)
     check(#"{"rateLimits":{"primary":{"usedPercent":15,"windowDurationMins":10080},"secondary":{"usedPercent":28,"windowDurationMins":300}}}"#, 72, false)
@@ -248,7 +325,40 @@ if CommandLine.arguments.contains("--self-test") {
     check(#"{"rateLimits":{"primary":{"usedPercent":120,"windowDurationMins":300}}}"#, 0, false)
     check(#"{"rateLimits":{"primary":{"usedPercent":-5,"windowDurationMins":300}}}"#, 100, false)
     check(#"{"rateLimits":{"primary":{"usedPercent":15,"windowDurationMins":10080}},"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":40,"windowDurationMins":300}}}}"#, 60, false)
-    print("PASS: weekly fallback, five-hour priority, absent data, clamping, bucket priority")
+    check(#"{"rateLimits":null,"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"windowDurationMins":300}}},"futureField":true}"#, 75, false)
+    check(#"{"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":10,"windowDurationMins":15}}}}"#, 90, false)
+    check(#"{}"#, nil, false)
+    precondition(UsageClient.rpcError(["code": -32601]).contains("接口不兼容"))
+    precondition(UsageClient.rpcError(["message": "401 Unauthorized"]).contains("重新登录"))
+    // Simulate a bundle update moving the executable, including an unknown layout.
+    let fm = FileManager.default
+    let fixture = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("quota-resolver-" + UUID().uuidString)
+    try! fm.createDirectory(at: fixture, withIntermediateDirectories: true)
+    do {
+        defer { try? fm.removeItem(at: fixture) }
+        func createCLI(_ relative: String) -> URL {
+            let url = fixture.appendingPathComponent("Contents/Resources/" + relative)
+            try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try! Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+            try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            return url
+        }
+        let old = createCLI("codex")
+        precondition(UsageClient.bundledExecutable(in: fixture) == old.path)
+        try! fm.removeItem(at: old)
+        precondition(UsageClient.bundledExecutable(in: fixture) == nil)
+        let updated = createCLI("codex-cli/bin/codex")
+        precondition(UsageClient.bundledExecutable(in: fixture) == updated.path)
+        try! fm.removeItem(at: updated)
+        let future = createCLI("tools/next/bin/codex")
+        let discovered = UsageClient.bundledExecutable(in: fixture)
+        precondition(discovered != nil)
+        // Directory enumeration may canonicalize /var to /private/var.
+        let expectedID = try! fm.attributesOfItem(atPath: future.path)[.systemFileNumber] as! NSNumber
+        let discoveredID = try! fm.attributesOfItem(atPath: discovered!)[.systemFileNumber] as! NSNumber
+        precondition(expectedID == discoveredID)
+    }
+    print("PASS: quota decoding, future windows, error classification, CLI relocation and rediscovery")
 } else if CommandLine.arguments.contains("--probe") {
     let client = UsageClient()
     client.fetch { result in
